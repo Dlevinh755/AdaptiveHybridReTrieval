@@ -10,8 +10,8 @@ from src.utils.logging import saved, skip
 
 
 EVAL_SOURCES = {
-    "bm25": ("merged_scores.parquet", "bm25_score"),
-    "bge": ("merged_scores.parquet", "bge_score"),
+    "bm25": ("bm25_scores.parquet", "bm25_score_norm"),
+    "bge": ("bge_scores.parquet", "bge_score_norm"),
     "hybrid_fixed": ("hybrid_fixed_scores.parquet", "hybrid_score"),
     "hybrid_tuned": ("hybrid_tuned_scores.parquet", "hybrid_score"),
     "hybrid_router": ("hybrid_router_scores.parquet", "hybrid_score"),
