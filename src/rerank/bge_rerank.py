@@ -25,6 +25,24 @@ def _limit_candidates(rows: list[dict[str, Any]], top_k: int, score_field: str) 
     return limited
 
 
+def _add_query_minmax_score(rows: list[dict[str, Any]], raw_field: str, norm_field: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["qid"]), []).append(dict(row))
+
+    normalized_rows: list[dict[str, Any]] = []
+    for items in grouped.values():
+        scores = [float(item.get(raw_field, 0.0)) for item in items]
+        lo = min(scores) if scores else 0.0
+        hi = max(scores) if scores else 0.0
+        denom = hi - lo
+        for item in items:
+            score = float(item.get(raw_field, 0.0))
+            item[norm_field] = (score - lo) / denom if abs(denom) > 1e-12 else 0.0
+            normalized_rows.append(item)
+    return normalized_rows
+
+
 def _chunk_text_by_id(config: Any) -> dict[str, str]:
     chunks = read_table(prepared_dir(config) / "chunks.parquet")
     return {str(row["chunk_id"]): row["text"] for row in chunks}
@@ -197,31 +215,35 @@ def _write_rerank_metrics(
     params: dict[str, Any],
     input_hash: str,
 ) -> None:
-    threshold_info = tune_threshold(split_rows["val"], split_questions["val"], score_field="rerank_score")
+    normalized_split_rows = {
+        split_name: _add_query_minmax_score(rows, "rerank_score", "rerank_score_norm")
+        for split_name, rows in split_rows.items()
+    }
+    threshold_info = tune_threshold(normalized_split_rows["val"], split_questions["val"], score_field="rerank_score_norm")
     threshold = float(threshold_info["threshold"])
-    topk_info = tune_top_k(split_rows["val"], split_questions["val"], score_field="rerank_score")
+    topk_info = tune_top_k(normalized_split_rows["val"], split_questions["val"], score_field="rerank_score_norm")
     tuned_top_k = int(topk_info["top_k"])
     metrics_by_split: dict[str, Any] = {}
     for split_name in ["val", "test"]:
-        rows = split_rows[split_name]
+        rows = normalized_split_rows[split_name]
         questions = split_questions[split_name]
         payload = {
             "split": split_name,
-            "score_field": "rerank_score",
+            "score_field": "rerank_score_norm",
             "candidate_unit": "chunk",
             "ranking_unit": "aid",
             "ranking": ranking_metrics(rows, questions),
             "threshold": {
                 "threshold": threshold,
-                **threshold_metrics(rows, questions, score_field="rerank_score", threshold=threshold),
+                **threshold_metrics(rows, questions, score_field="rerank_score_norm", threshold=threshold),
             },
             "topk_fixed_3": {
                 "top_k": 3,
-                **topk_metrics(rows, questions, score_field="rerank_score", k=3),
+                **topk_metrics(rows, questions, score_field="rerank_score_norm", k=3),
             },
             "topk_tuned": {
                 "top_k": tuned_top_k,
-                **topk_metrics(rows, questions, score_field="rerank_score", k=tuned_top_k),
+                **topk_metrics(rows, questions, score_field="rerank_score_norm", k=tuned_top_k),
             },
             "topk_selection_split": "val",
             "threshold_selection_split": "val",
@@ -242,7 +264,7 @@ def _write_rerank_metrics(
         threshold_path,
         {
             "selection_split": "val",
-            "score_field": "rerank_score",
+            "score_field": "rerank_score_norm",
             "best_threshold": threshold,
             "val": threshold_info,
             "best_top_k": tuned_top_k,

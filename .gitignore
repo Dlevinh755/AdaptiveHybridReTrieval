@@ -11,6 +11,8 @@ __pycache__/
 .venv/
 venv/
 env/
+tranining_sumary/
+report/
 
 # Local data and generated artifacts
 outputs/

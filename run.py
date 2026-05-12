@@ -82,6 +82,8 @@ def run(config: Config) -> None:
         stages = PREPARE_TRAINING_DATA_ORDER
     elif config.stage == "train_bge_retriever":
         stages = TRAIN_BGE_RETRIEVER_ORDER
+    elif config.stage == "tune_and_build_bm25":
+        stages = ["tune_bm25", "build_bm25"]
     else:
         stages = [config.stage]
 

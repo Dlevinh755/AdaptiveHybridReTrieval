@@ -75,13 +75,33 @@ def ranking_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]],
     return {key: value / count for key, value in totals.items()}
 
 
-def threshold_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]], *, score_field: str, threshold: float) -> dict[str, float]:
+def threshold_metrics(
+    rows: list[dict[str, Any]],
+    questions: list[dict[str, Any]],
+    *,
+    score_field: str,
+    threshold: float,
+    fallback_top_k_if_empty: int = 3,
+    max_candidates_per_query: int = 5,
+) -> dict[str, float]:
     positives_by_qid = {row["qid"]: set(row["relevant_laws"]) for row in questions}
     tp = fp = fn = 0
     predicted_by_qid: dict[str, set[str]] = defaultdict(set)
-    for row in aggregate_by_aid_max(rows, score_field):
-        if float(row.get(score_field, 0.0)) >= threshold:
-            predicted_by_qid[row["qid"]].add(row["aid"])
+    grouped = group_ranked(rows, score_field=score_field)
+
+    for qid, items in grouped.items():
+        predicted = {
+            row["aid"]
+            for row in items
+            if float(row.get(score_field, 0.0)) >= threshold
+        }
+        if not predicted and fallback_top_k_if_empty > 0 and items:
+            predicted = {row["aid"] for row in items[:fallback_top_k_if_empty]}
+        if len(predicted) > max_candidates_per_query and items:
+            top_items = sorted(items, key=lambda r: float(r.get(score_field, 0.0)), reverse=True)[:max_candidates_per_query]
+            predicted = {row["aid"] for row in top_items}
+        predicted_by_qid[qid] = predicted
+
     for qid, positives in positives_by_qid.items():
         predicted = predicted_by_qid.get(qid, set())
         tp += len(predicted & positives)
@@ -174,3 +194,5 @@ def _infer_score_field(rows: list[dict[str, Any]]) -> str | None:
         if rows and field in rows[0]:
             return field
     return None
+
+

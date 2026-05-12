@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,39 @@ from src.utils.artifact import ensure_dir
 
 
 SCORE_FORMULA = 'sigmoid(logit("1") - logit("0"))'
+PROGRESS_LOG_PERCENT = 5
+
+
+def _progress_iter(items: Sequence[Any], desc: str, unit: str) -> Iterator[Any]:
+    total = len(items)
+    if total == 0:
+        return
+
+    step = max(1, math.ceil(total * PROGRESS_LOG_PERCENT / 100))
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        tqdm = None
+
+    if tqdm is None:
+        next_log = step
+        for index, item in enumerate(items, start=1):
+            yield item
+            if index >= next_log or index == total:
+                percent = min(100, round(index * 100 / total))
+                print(f"[progress] {desc}: {index}/{total} {unit} ({percent}%)")
+                while next_log <= index:
+                    next_log += step
+        return
+
+    with tqdm(total=total, desc=desc, unit=unit, miniters=step, mininterval=0) as bar:
+        next_update = step
+        for index, item in enumerate(items, start=1):
+            yield item
+            if index >= next_update or index == total:
+                bar.update(index - bar.n)
+                while next_update <= index:
+                    next_update += step
 
 
 def _import_runtime() -> tuple[Any, Any, Any]:
@@ -124,7 +158,10 @@ def train(config: Any, train_rows: list[dict[str, Any]], model_dir: Path) -> dic
     )
     model.train()
 
-    examples = [_training_example(tokenizer, row, int(config.llm_rerank_max_length)) for row in train_rows]
+    examples = [
+        _training_example(tokenizer, row, int(config.llm_rerank_max_length))
+        for row in _progress_iter(train_rows, "LLM reranker tokenize", "examples")
+    ]
     examples = [row for row in examples if row["input_ids"] and any(label != -100 for label in row["labels"])]
     if not examples:
         raise ValueError("No LLM reranker training examples were built.")
@@ -140,7 +177,8 @@ def train(config: Any, train_rows: list[dict[str, Any]], model_dir: Path) -> dic
     for epoch in range(int(config.llm_rerank_epochs)):
         rng.shuffle(examples)
         optimizer.zero_grad(set_to_none=True)
-        for start in range(0, len(examples), batch_size):
+        batch_starts = range(0, len(examples), batch_size)
+        for start in _progress_iter(batch_starts, f"LLM reranker train epoch {epoch + 1}", "batches"):
             batch = _collate(tokenizer, torch, examples[start : start + batch_size])
             batch = {key: value.to(device) for key, value in batch.items()}
             output = model(**batch)
@@ -182,20 +220,30 @@ def score(config: Any, model_dir: Path, pairs: list[dict[str, str]]) -> list[flo
     torch, model, tokenizer = _load_inference_model(config, model_dir)
     zero_id, one_id = _binary_token_ids(tokenizer)
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    batch_size = max(1, int(getattr(config, "llm_rerank_batch_size", 1)))
     scores: list[float] = []
     model.eval()
     with torch.no_grad():
-        for pair in pairs:
-            messages = build_llm_rerank_messages(pair["question"], pair["chunk_text"], label=None)
-            prompt = _render_chat(tokenizer, messages, add_generation_prompt=True)
+        batch_starts = range(0, len(pairs), batch_size)
+        for start in _progress_iter(batch_starts, "LLM reranker infer", "batches"):
+            prompts = []
+            for pair in pairs[start : start + batch_size]:
+                messages = build_llm_rerank_messages(pair["question"], pair["chunk_text"], label=None)
+                prompts.append(_render_chat(tokenizer, messages, add_generation_prompt=True))
             inputs = tokenizer(
-                prompt,
+                prompts,
                 return_tensors="pt",
+                padding=True,
                 truncation=True,
                 max_length=int(config.llm_rerank_max_length),
             )
             inputs = {key: value.to(device) for key, value in inputs.items()}
-            logits = model(**inputs).logits[0, -1]
-            delta = float((logits[one_id] - logits[zero_id]).detach().cpu())
-            scores.append(1.0 / (1.0 + math.exp(-delta)))
+            output = model(**inputs)
+            seq_len = int(inputs["attention_mask"].shape[1])
+            positions = torch.arange(seq_len, device=device).unsqueeze(0)
+            last_indices = (inputs["attention_mask"].long() * positions).max(dim=1).values
+            row_indices = torch.arange(last_indices.shape[0], device=device)
+            logits = output.logits[row_indices, last_indices]
+            deltas = (logits[:, one_id] - logits[:, zero_id]).detach().cpu().tolist()
+            scores.extend(1.0 / (1.0 + math.exp(-float(delta))) for delta in deltas)
     return scores

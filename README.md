@@ -210,7 +210,8 @@ python3 run.py \
   --questions_path raw_data/legalraw/full/train.json \
   --output_dir outputs \
   --use_llm_rerank true \
-  --llm_rerank_top_k 20
+  --llm_rerank_top_k 20 \
+  --llm_rerank_batch_size 4
 ```
 
 LLM rerank writes:

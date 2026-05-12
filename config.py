@@ -59,6 +59,7 @@ class Config:
     use_llm_rerank: bool
     llm_rerank_top_k: int
     llm_rerank_train_batch_size: int
+    llm_rerank_batch_size: int
     llm_rerank_grad_accum: int
     llm_rerank_epochs: int
     llm_rerank_lr: float
@@ -142,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_llm_rerank", type=str2bool, default=False)
     parser.add_argument("--llm_rerank_top_k", type=int, default=20)
     parser.add_argument("--llm_rerank_train_batch_size", type=int, default=1)
+    parser.add_argument("--llm_rerank_batch_size", type=int, default=4)
     parser.add_argument("--llm_rerank_grad_accum", type=int, default=8)
     parser.add_argument("--llm_rerank_epochs", type=int, default=1)
     parser.add_argument("--llm_rerank_lr", type=float, default=2e-4)
