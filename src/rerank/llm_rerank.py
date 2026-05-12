@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
+from src.eval.metrics import aggregate_by_aid_max, ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
 from src.rerank.bge_rerank import _assert_max_candidates, _assert_no_duplicate_chunks, _limit_candidates
 from src.training.llm_rerank_backends import get_backend
 from src.training.llm_rerank_backends.unsloth_causal_lm import SCORE_FORMULA
@@ -69,13 +69,17 @@ def _write_llm_metrics(
         split_name: _add_query_minmax_score(rows, "llm_rerank_score", "llm_rerank_score_norm")
         for split_name, rows in split_rows.items()
     }
-    threshold_info = tune_threshold(normalized_split_rows["val"], split_questions["val"], score_field="llm_rerank_score_norm")
+    aid_aggregated_rows = {
+        split_name: aggregate_by_aid_max(rows, score_field="llm_rerank_score_norm")
+        for split_name, rows in normalized_split_rows.items()
+    }
+    threshold_info = tune_threshold(aid_aggregated_rows["val"], split_questions["val"], score_field="llm_rerank_score_norm")
     threshold = float(threshold_info["threshold"])
-    topk_info = tune_top_k(normalized_split_rows["val"], split_questions["val"], score_field="llm_rerank_score_norm")
+    topk_info = tune_top_k(aid_aggregated_rows["val"], split_questions["val"], score_field="llm_rerank_score_norm")
     tuned_top_k = int(topk_info["top_k"])
     metrics_by_split: dict[str, Any] = {}
     for split_name in ["val", "test"]:
-        rows = normalized_split_rows[split_name]
+        rows = aid_aggregated_rows[split_name]
         questions = split_questions[split_name]
         payload = {
             "split": split_name,
@@ -222,10 +226,12 @@ def rerank_llm(config: Any) -> None:
 
     input_hash = stable_hash({"source": source_paths, "rows": len(all_ranked), "top_k": config.llm_rerank_top_k})
     for split_name, split_path in split_paths.items():
-        split_fmt = write_table(split_path, split_rows_by_name[split_name])
+        split_rows_with_norm = _add_query_minmax_score(split_rows_by_name[split_name], "llm_rerank_score", "llm_rerank_score_norm")
+        split_fmt = write_table(split_path, split_rows_with_norm)
         mark_done(split_path, config=config, stage="rerank_llm", input_hash=input_hash, model=config.llm_rerank_model, params={**expected_params, "split": split_name}, fmt=split_fmt)
         saved(split_path)
-    fmt = write_table(path, all_ranked)
+    all_ranked_with_norm = _add_query_minmax_score(all_ranked, "llm_rerank_score", "llm_rerank_score_norm")
+    fmt = write_table(path, all_ranked_with_norm)
     mark_done(path, config=config, stage="rerank_llm", input_hash=input_hash, model=config.llm_rerank_model, params={**expected_params, "split": "aggregate"}, fmt=fmt)
 
     split_questions = {

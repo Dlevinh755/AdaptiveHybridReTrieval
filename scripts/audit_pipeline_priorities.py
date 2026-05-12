@@ -34,7 +34,7 @@ from scripts.check_summary_consistency import (
     top_pairs,
 )
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics
+from src.eval.metrics import aggregate_by_aid_max, ranking_metrics, threshold_metrics, topk_metrics
 
 
 def section(index: int, title: str) -> None:
@@ -163,9 +163,11 @@ def check_rerank_chunk_to_aid_aggregation(dataset_dir: Path, rows_by_split: dict
             split_qids = {str(qid) for qid in splits[split]}
             questions = [question for qid, question in questions_by_qid.items() if qid in split_qids]
             detail = read_json(detail_path)
-            recomputed_ranking = ranking_metrics(rows, questions)
-            recomputed_threshold = threshold_metrics(rows, questions, score_field="rerank_score", threshold=detail["threshold"]["threshold"])
-            recomputed_topk = topk_metrics(rows, questions, score_field="rerank_score", k=int(detail["topk_tuned"]["top_k"]))
+            score_field = str(detail.get("score_field", "rerank_score"))
+            aid_aggregated_rows = aggregate_by_aid_max(rows, score_field=score_field)
+            recomputed_ranking = ranking_metrics(aid_aggregated_rows, questions)
+            recomputed_threshold = threshold_metrics(aid_aggregated_rows, questions, score_field=score_field, threshold=detail["threshold"]["threshold"])
+            recomputed_topk = topk_metrics(aid_aggregated_rows, questions, score_field=score_field, k=int(detail["topk_tuned"]["top_k"]))
             for metric in ["hit@10", "recall@10", "ndcg@10"]:
                 assert_close(f"bge_rerank_{split}.{metric}.aid_max_recomputed", detail["ranking"][metric], recomputed_ranking[metric])
             for metric in ["precision", "recall", "f2"]:

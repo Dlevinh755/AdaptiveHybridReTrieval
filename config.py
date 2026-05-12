@@ -21,6 +21,7 @@ STAGES = [
     "split",
     "prepare_training_data",
     "tune_bm25",
+    "tune_and_build_bm25",
     "build_bm25",
     "build_dense_index",
     "mine_hard_negatives",
@@ -80,6 +81,7 @@ class Config:
     bge_gradient_checkpointing: bool
     bge_auto_batch_reduce: bool
     bge_negatives_per_example: int
+    bge_grad_accum: int
     reranker_train_batch_size: int
     reranker_epochs: int
     reranker_lr: float
@@ -87,6 +89,7 @@ class Config:
     reranker_max_length: int
     reranker_max_train_examples: int
     reranker_use_amp: bool
+    reranker_grad_accum: int
 
     bm25_k1: float
     bm25_b: float
@@ -143,54 +146,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_llm_rerank", type=str2bool, default=False)
     parser.add_argument("--llm_rerank_top_k", type=int, default=20)
     parser.add_argument("--llm_rerank_train_batch_size", type=int, default=1)
-    parser.add_argument("--llm_rerank_batch_size", type=int, default=4)
-    parser.add_argument("--llm_rerank_grad_accum", type=int, default=8)
+    parser.add_argument("--llm_rerank_batch_size", type=int, default=16)
+    parser.add_argument("--llm_rerank_grad_accum", type=int, default=2)
     parser.add_argument("--llm_rerank_epochs", type=int, default=1)
-    parser.add_argument("--llm_rerank_lr", type=float, default=2e-4)
-    parser.add_argument("--llm_rerank_max_length", type=int, default=1024)
-    parser.add_argument("--llm_rerank_max_train_examples", type=int, default=0)
+    parser.add_argument("--llm_rerank_lr", type=float, default=2e-5)
+    parser.add_argument("--llm_rerank_max_length", type=int, default=630)
+    parser.add_argument("--llm_rerank_max_train_examples", type=int, default=12000)
     parser.add_argument("--llm_rerank_lora_r", type=int, default=16)
     parser.add_argument("--llm_rerank_lora_alpha", type=int, default=16)
     parser.add_argument("--llm_rerank_load_in_4bit", type=str2bool, default=True)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--bge_train_batch_size", type=int, default=16)
-    parser.add_argument("--bge_epochs", type=int, default=1)
+    parser.add_argument("--bge_epochs", type=int, default=2)
     parser.add_argument("--bge_lr", type=float, default=2e-5)
     parser.add_argument("--bge_warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--bge_max_length", type=int, default=512)
+    parser.add_argument("--bge_max_length", type=int, default=522)
     parser.add_argument("--bge_max_train_examples", type=int, default=0)
     parser.add_argument("--bge_use_amp", type=str2bool, default=True)
     parser.add_argument("--bge_gradient_checkpointing", type=str2bool, default=True)
     parser.add_argument("--bge_auto_batch_reduce", type=str2bool, default=True)
     parser.add_argument("--bge_negatives_per_example", type=int, default=3)
+    parser.add_argument("--bge_grad_accum", type=int, default=1)
     parser.add_argument("--reranker_train_batch_size", type=int, default=4)
     parser.add_argument("--reranker_epochs", type=int, default=1)
     parser.add_argument("--reranker_lr", type=float, default=2e-5)
     parser.add_argument("--reranker_warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--reranker_max_length", type=int, default=512)
+    parser.add_argument("--reranker_max_length", type=int, default=582)
     parser.add_argument("--reranker_max_train_examples", type=int, default=0)
     parser.add_argument("--reranker_use_amp", type=str2bool, default=True)
+    parser.add_argument("--reranker_grad_accum", type=int, default=2)
 
     parser.add_argument("--bm25_k1", type=float, default=1.2)
     parser.add_argument("--bm25_b", type=float, default=0.9)
     parser.add_argument("--bm25_k1_grid", default="1.2")
     parser.add_argument("--bm25_b_grid", default="0.9")
-    parser.add_argument("--bm25_tune_metric", default="recall@10")
+    parser.add_argument("--bm25_tune_metric", default="recall@20")
     parser.add_argument("--use_tuned_bm25", type=str2bool, default=True)
     parser.add_argument("--hybrid_alpha", type=float, default=0.5)
-    parser.add_argument("--alpha_grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
+    parser.add_argument("--alpha_grid", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8")
     parser.add_argument("--router_model", default="ridge", choices=["ridge"])
-    parser.add_argument("--top_k", type=int, default=100)
+    parser.add_argument("--top_k", type=int, default=200)
     parser.add_argument("--candidate_top_k", type=int, default=50)
     parser.add_argument("--positive_chunks_per_aid", type=int, default=2)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.75)
 
     parser.add_argument("--train_ratio", type=float, default=0.70)
     parser.add_argument("--router_train_ratio", type=float, default=0.10)
     parser.add_argument("--val_ratio", type=float, default=0.10)
     parser.add_argument("--test_ratio", type=float, default=0.10)
-    parser.add_argument("--max_chunk_tokens", type=int, default=450)
+    parser.add_argument("--max_chunk_tokens", type=int, default=512)
     parser.add_argument("--chunk_overlap_sentences", type=int, default=1)
     parser.add_argument("--max_chunks", type=int, default=0, help="If >0, fail prepare_data when total chunks exceeds this value.")
     parser.add_argument("--max_chunks_per_article", type=int, default=0, help="If >0, keep only this many chunks per article.")

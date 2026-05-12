@@ -16,7 +16,7 @@ from src.utils.logging import saved, skip
 
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 ROUTER_SCHEMA_VERSION = 3
-ROUTER_LABEL_K = 8.0
+ROUTER_LABEL_TEMPERATURE = 0.2
 
 
 def _tokenize(text: str) -> list[str]:
@@ -68,17 +68,17 @@ def _group_rows(rows: list[dict[str, Any]], score_field: str) -> dict[str, list[
     }
 
 
-def _recall_at_10_for_qid(rows: list[dict[str, Any]], question: dict[str, Any]) -> float:
+def _recall_at_k_for_qid(rows: list[dict[str, Any]], question: dict[str, Any], k: int = 10) -> float:
     positives = {str(aid) for aid in question["relevant_laws"]}
-    hits = {str(row["aid"]) for row in rows[:10]}
+    hits = {str(row["aid"]) for row in rows[:k]}
     return len(hits & positives) / max(len(positives), 1)
 
 
-def _ndcg_at_10_for_qid(rows: list[dict[str, Any]], question: dict[str, Any]) -> float:
+def _ndcg_at_k_for_qid(rows: list[dict[str, Any]], question: dict[str, Any], k: int = 10) -> float:
     positives = {str(aid) for aid in question["relevant_laws"]}
-    labels = [1 if str(row["aid"]) in positives else 0 for row in rows[:10]]
+    labels = [1 if str(row["aid"]) in positives else 0 for row in rows[:k]]
     dcg = sum(label / math.log2(idx + 2) for idx, label in enumerate(labels))
-    ideal = [1] * min(len(positives), 10)
+    ideal = [1] * min(len(positives), k)
     idcg = sum(label / math.log2(idx + 2) for idx, label in enumerate(ideal))
     return dcg / idcg if idcg > 0 else 0.0
 
@@ -91,13 +91,19 @@ def _make_alpha_labels(router_rows: list[dict[str, Any]], router_questions: list
         qid = str(question["qid"])
         bm25_ranked = bm25_grouped.get(qid, [])
         bge_ranked = bge_grouped.get(qid, [])
-        r10_bm25 = _recall_at_10_for_qid(bm25_ranked, question)
-        r10_bge = _recall_at_10_for_qid(bge_ranked, question)
-        ndcg10_bm25 = _ndcg_at_10_for_qid(bm25_ranked, question)
-        ndcg10_bge = _ndcg_at_10_for_qid(bge_ranked, question)
-        dense_perf = 0.7 * r10_bge + 0.3 * ndcg10_bge
-        sparse_perf = 0.7 * r10_bm25 + 0.3 * ndcg10_bm25
-        alpha_soft = _sigmoid(ROUTER_LABEL_K * (dense_perf - sparse_perf))
+        r10_bm25 = _recall_at_k_for_qid(bm25_ranked, question, k=10)
+        r10_bge = _recall_at_k_for_qid(bge_ranked, question, k=10)
+        ndcg10_bm25 = _ndcg_at_k_for_qid(bm25_ranked, question, k=10)
+        ndcg10_bge = _ndcg_at_k_for_qid(bge_ranked, question, k=10)
+        r20_bm25 = _recall_at_k_for_qid(bm25_ranked, question, k=20)
+        r20_bge = _recall_at_k_for_qid(bge_ranked, question, k=20)
+        r50_bm25 = _recall_at_k_for_qid(bm25_ranked, question, k=50)
+        r50_bge = _recall_at_k_for_qid(bge_ranked, question, k=50)
+        ndcg20_bm25 = _ndcg_at_k_for_qid(bm25_ranked, question, k=20)
+        ndcg20_bge = _ndcg_at_k_for_qid(bge_ranked, question, k=20)
+        dense_perf = 0.2 * r50_bge + 0.6 * r20_bge + 0.2 * ndcg20_bge
+        sparse_perf = 0.2 * r50_bm25 + 0.6 * r20_bm25 + 0.2 * ndcg20_bm25
+        alpha_soft = _sigmoid((dense_perf - sparse_perf) / ROUTER_LABEL_TEMPERATURE)
         labels.append(
             {
                 "qid": qid,
@@ -106,6 +112,12 @@ def _make_alpha_labels(router_rows: list[dict[str, Any]], router_questions: list
                 "r10_bge": r10_bge,
                 "ndcg10_bm25": ndcg10_bm25,
                 "ndcg10_bge": ndcg10_bge,
+                "r20_bm25": r20_bm25,
+                "r20_bge": r20_bge,
+                "r50_bm25": r50_bm25,
+                "r50_bge": r50_bge,
+                "ndcg20_bm25": ndcg20_bm25,
+                "ndcg20_bge": ndcg20_bge,
                 "dense_perf": dense_perf,
                 "sparse_perf": sparse_perf,
                 "alpha_soft": alpha_soft,
@@ -213,7 +225,7 @@ def _alpha_diagnostics(labels: list[dict[str, Any]], predictions: np.ndarray) ->
     return {
         "alpha_convention": "alpha_is_weight_bge",
         "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
-        "label_formula": "sigmoid(k * (dense_perf - sparse_perf))",
+        "label_formula": "sigmoid((dense_perf - sparse_perf) / temperature)",
         "label_gt_0.5_means": "BGE preferred",
         "label_lt_0.5_means": "BM25 preferred",
         "convention_self_check_passed": convention_ok,
@@ -232,7 +244,12 @@ def train_router(config: Any) -> None:
     labels_path = eval_dir(config) / "router_alpha_labels.jsonl"
     metrics_path = eval_dir(config) / "router_metrics.json"
     config_path = eval_dir(config) / "router_config.json"
-    expected_params = {"schema_version": ROUTER_SCHEMA_VERSION, "top_k": config.top_k, "label_k": ROUTER_LABEL_K, "model": "tfidf_ridge"}
+    expected_params = {
+        "schema_version": ROUTER_SCHEMA_VERSION,
+        "top_k": config.top_k,
+        "label_temperature": ROUTER_LABEL_TEMPERATURE,
+        "model": "tfidf_ridge",
+    }
     expected = {"model": config.router_model, "params": expected_params}
     expected_outputs = [
         model_path,
@@ -300,10 +317,10 @@ def train_router(config: Any) -> None:
         config_path,
         {
             "model_type": "tfidf_ridge",
-            "label_formula": "sigmoid(k * ((0.7*r10_bge + 0.3*ndcg10_bge) - (0.7*r10_bm25 + 0.3*ndcg10_bm25)))",
+            "label_formula": "sigmoid(((0.6*r50_bge + 0.2*r20_bge + 0.2*ndcg20_bge) - (0.6*r50_bm25 + 0.2*r20_bm25 + 0.2*ndcg20_bm25)) / temperature)",
             "alpha_convention": "alpha_is_weight_bge",
             "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
-            "label_k": ROUTER_LABEL_K,
+            "label_temperature": ROUTER_LABEL_TEMPERATURE,
             "train_split": "router",
             "fixed_alpha": 0.5,
             "vocab_size": len(vectorizer["vocab"]),
@@ -362,7 +379,7 @@ def train_router(config: Any) -> None:
         },
         "fixed_alpha": 0.5,
         "router_model": "tfidf_ridge",
-        "label_k": ROUTER_LABEL_K,
+        "label_temperature": ROUTER_LABEL_TEMPERATURE,
         "alpha_convention": "alpha_is_weight_bge",
         "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
         "splits": {},

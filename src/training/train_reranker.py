@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from typing import Any
 
@@ -26,6 +27,7 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
     params = {
         "epochs": config.reranker_epochs,
         "batch_size": config.reranker_train_batch_size,
+        "grad_accum": config.reranker_grad_accum,
         "lr": config.reranker_lr,
         "warmup_ratio": config.reranker_warmup_ratio,
         "max_length": config.reranker_max_length,
@@ -48,33 +50,88 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
     if not train_rows:
         raise ValueError(f"No reranker training rows found for train split in {pairs_path}")
 
-    from sentence_transformers import CrossEncoder, InputExample
+    import torch
     from torch.utils.data import DataLoader
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
-    examples = []
+    examples: list[dict[str, Any]] = []
     for row in train_rows:
         for passage in row["passages"]:
-            examples.append(InputExample(texts=[row["query"], passage["text"]], label=float(passage["label"])))
+            examples.append({"text_a": row["query"], "text_b": passage["text"], "label": float(passage["label"])})
     random.Random(config.seed).shuffle(examples)
     if config.reranker_max_train_examples > 0:
         examples = examples[: config.reranker_max_train_examples]
     if not examples:
         raise ValueError("No reranker training examples were built.")
 
+    print(f"[train_reranker] first_sample={examples[0]!r}")
+
     ensure_dir(model_dir)
-    train_dataloader = DataLoader(examples, shuffle=True, batch_size=config.reranker_train_batch_size)
-    warmup_steps = int(len(train_dataloader) * config.reranker_epochs * config.reranker_warmup_ratio)
-    model = CrossEncoder(model_name, num_labels=1, max_length=config.reranker_max_length, device=config.device)
-    model.fit(
-        train_dataloader=train_dataloader,
-        epochs=config.reranker_epochs,
-        warmup_steps=warmup_steps,
-        optimizer_params={"lr": config.reranker_lr},
-        output_path=None,
-        save_best_model=False,
-        use_amp=bool(config.reranker_use_amp and config.device == "cuda"),
+    device = torch.device(config.device if config.device == "cuda" and torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1).to(device)
+    if getattr(model.config, "use_cache", None) is not None:
+        model.config.use_cache = False
+
+    def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = tokenizer(
+            [str(item["text_a"]) for item in batch],
+            [str(item["text_b"]) for item in batch],
+            padding=True,
+            truncation=True,
+            max_length=config.reranker_max_length,
+            return_tensors="pt",
+        )
+        encoded["labels"] = torch.tensor([float(item["label"]) for item in batch], dtype=torch.float32)
+        return encoded
+
+    train_dataloader = DataLoader(examples, shuffle=True, batch_size=config.reranker_train_batch_size, collate_fn=collate)
+    grad_accum = max(1, int(config.reranker_grad_accum))
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_dataloader) / grad_accum))
+    warmup_steps = int(optimizer_steps_per_epoch * config.reranker_epochs * config.reranker_warmup_ratio)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.reranker_lr)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max(1, optimizer_steps_per_epoch * config.reranker_epochs),
     )
-    model.save(str(model_dir))
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(config.reranker_use_amp and device.type == "cuda"))
+    losses: list[float] = []
+    optimizer_steps = 0
+    log_every = 10
+    print(f"[train_reranker] training with grad_accum={grad_accum}")
+    model.train()
+    for epoch in range(config.reranker_epochs):
+        optimizer.zero_grad(set_to_none=True)
+        epoch_loss_total = 0.0
+        for step, batch in enumerate(train_dataloader, start=1):
+            labels = batch.pop("labels").to(device)
+            batch = {key: value.to(device) for key, value in batch.items()}
+            with torch.amp.autocast(device_type="cuda", enabled=bool(config.reranker_use_amp and device.type == "cuda")):
+                outputs = model(**batch)
+                logits = outputs.logits.squeeze(-1)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits.float(), labels.float())
+                scaled_loss = loss / grad_accum
+            scaler.scale(scaled_loss).backward()
+            losses.append(float(loss.detach().cpu()))
+            epoch_loss_total += float(loss.detach().cpu())
+            if step == 1 or step % log_every == 0 or step == len(train_dataloader):
+                avg_loss = epoch_loss_total / step
+                print(f"[train_reranker] epoch={epoch + 1}/{config.reranker_epochs} step={step}/{len(train_dataloader)} loss={avg_loss:.4f}")
+            if step % grad_accum == 0 or step == len(train_dataloader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() >= scale_before:
+                    scheduler.step()
+                    optimizer_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+        print(f"[train_reranker] epoch={epoch + 1}/{config.reranker_epochs} avg_loss={epoch_loss_total / max(len(train_dataloader), 1):.4f}")
+
+    model.save_pretrained(str(model_dir))
+    tokenizer.save_pretrained(str(model_dir))
 
     write_json(
         marker,
@@ -89,6 +146,7 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
             "train_qids": len(train_qids),
             "subtrain_qids": len(subtrain_qids),
             "subval_qids": len(subval_qids),
+            "optimizer_steps": optimizer_steps,
             "params": params,
         },
     )

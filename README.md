@@ -227,3 +227,38 @@ outputs/<dataset>/eval/llm_rerank_threshold.json
 ```
 
 `evaluate` builds `eval/summary.json` from the detailed per-method metrics files when they exist, so threshold metrics in the summary match files like `hybrid_router_val_metrics.json` and `bge_rerank_test_metrics.json`.
+
+## Demo UI
+
+After building the indexes and router artifacts, start the simple browser demo:
+
+```bash
+python demo_app.py \
+  --dataset_name legalraw_full \
+  --corpus_path raw_data/legalraw/full/legal_corpus.json \
+  --questions_path raw_data/legalraw/full/train.json \
+  --output_dir outputs \
+  --device cpu \
+  --port 8000
+```
+
+Open `http://127.0.0.1:8000`, enter a legal question, and the UI will run:
+
+```text
+BM25 + dense retrieval -> router alpha hybrid top 20 -> BGE rerank -> configurable top N aid
+```
+
+The UI lets you choose how many `aid` results to return, up to the hybrid retrieval candidate limit. Each result shows `aid`, `law_id`, hybrid/rerank scores, and a shortened matching excerpt; the full article text is shown only after opening the detail section. The demo expects these artifacts to exist first:
+
+```text
+prepared/articles.parquet
+prepared/chunks.parquet
+prepared/aid2chunks.json
+indexes/bm25/...
+indexes/faiss/...
+models/router_alpha_regressor.joblib
+```
+
+For reranking, the demo defaults to `outputs/<dataset>/models/bge_reranker` when that trained checkpoint exists. If it is missing, it falls back to `BAAI/bge-reranker-v2-m3`. You can still override this with `--rerank_model`.
+
+For dense retrieval, the demo defaults to the `dense_model_requested` value recorded in the existing FAISS metadata. If no dense metadata exists, it falls back to `BAAI/bge-m3`. You can still override this with `--dense_model`.

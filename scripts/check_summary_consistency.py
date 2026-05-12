@@ -384,7 +384,8 @@ def check_val_threshold_is_best_f2(dataset_dir: Path, questions_by_qid: dict[str
             continue
         rows = read_records(cache_path)
         detail = read_json(detail_path)
-        best = tune_threshold(rows, val_questions, score_field=score_field)
+        detail_score_field = str(detail.get("score_field", score_field))
+        best = tune_threshold(rows, val_questions, score_field=detail_score_field)
         threshold = detail.get("threshold", {})
         for metric in ["threshold", "precision", "recall", "f2"]:
             assert_close(f"{method}_val.best_f2_{metric}", threshold[metric], best[metric])
@@ -407,12 +408,13 @@ def check_val_topk_is_best_f2(dataset_dir: Path, questions_by_qid: dict[str, dic
             continue
         rows = read_records(cache_path)
         detail = read_json(detail_path)
-        best = tune_top_k(rows, val_questions, score_field=score_field)
+        detail_score_field = str(detail.get("score_field", score_field))
+        best = tune_top_k(rows, val_questions, score_field=detail_score_field)
         topk = detail.get("topk_tuned", {})
         for metric in ["top_k", "precision", "recall", "f2"]:
             assert_close(f"{method}_val.best_topk_{metric}", topk[metric], best[metric])
         fixed_3 = detail.get("topk_fixed_3", {})
-        recomputed_3 = {"top_k": 3, **topk_metrics(rows, val_questions, score_field=score_field, k=3)}
+        recomputed_3 = {"top_k": 3, **topk_metrics(rows, val_questions, score_field=detail_score_field, k=3)}
         for metric in ["top_k", "precision", "recall", "f2", "precision@3", "recall@3", "f2@3"]:
             assert_close(f"{method}_val.topk3_{metric}", fixed_3[metric], recomputed_3[metric])
         print(f"[ok] {method}_val top-k maximizes F2 on val:", best)
@@ -751,8 +753,9 @@ def main() -> None:
             questions = [row for row in load_questions(_Config()) if str(row["qid"]) in split_qids]
             detail = read_json(detail_path)
             recomputed_ranking = ranking_metrics(rows, questions)
-            recomputed_threshold = threshold_metrics(rows, questions, score_field="rerank_score", threshold=detail["threshold"]["threshold"])
-            recomputed_topk = topk_metrics(rows, questions, score_field="rerank_score", k=int(detail["topk_tuned"]["top_k"]))
+            score_field = str(detail.get("score_field", "rerank_score"))
+            recomputed_threshold = threshold_metrics(rows, questions, score_field=score_field, threshold=detail["threshold"]["threshold"])
+            recomputed_topk = topk_metrics(rows, questions, score_field=score_field, k=int(detail["topk_tuned"]["top_k"]))
             for metric in ["hit@10", "recall@10", "ndcg@10"]:
                 assert_close(f"bge_rerank_{split}.{metric}.recomputed", detail["ranking"][metric], recomputed_ranking[metric])
             for metric in ["precision", "recall", "f2"]:

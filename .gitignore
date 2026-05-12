@@ -28,3 +28,6 @@ raw_data/
 .cache/
 wandb/
 mlruns/
+
+descrep.md
+handoff.md

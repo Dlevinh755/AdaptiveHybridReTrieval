@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import random
 from typing import Any
 
@@ -48,6 +49,7 @@ def train_bge(config: Any) -> None:
     params = {
         "epochs": config.bge_epochs,
         "batch_size": config.bge_train_batch_size,
+        "grad_accum": config.bge_grad_accum,
         "lr": config.bge_lr,
         "warmup_ratio": config.bge_warmup_ratio,
         "max_length": config.bge_max_length,
@@ -107,11 +109,14 @@ def train_bge(config: Any) -> None:
     if not triplets:
         raise ValueError("No BGE training triplets were built.")
 
+    print(f"[train_bge] first_sample={triplets[0]!r}")
+
     ensure_dir(model_dir)
 
     print(f"[train_bge] GPU memory note:")
     print(f"  - Total triplets: {len(triplets)}")
     print(f"  - Batch size: {config.bge_train_batch_size} (reduce if OOM)")
+    print(f"  - Grad accumulation: {max(int(config.bge_grad_accum), 1)}")
     print(f"  - Epochs: {config.bge_epochs}")
     print(f"  - Max length: {config.bge_max_length}")
     print(f"  - AMP enabled: {config.bge_use_amp}")
@@ -166,6 +171,7 @@ def train_bge(config: Any) -> None:
                 pass
 
     batch_size = max(1, int(config.bge_train_batch_size))
+    grad_accum = max(1, int(config.bge_grad_accum))
     last_oom: RuntimeError | None = None
     tokenizer = None
     encoder = None
@@ -173,12 +179,13 @@ def train_bge(config: Any) -> None:
         clear_cuda()
         tokenizer, encoder = build_model()
         train_dataloader = DataLoader(triplets, shuffle=True, batch_size=batch_size, collate_fn=_collate_triplets, num_workers=0)
-        warmup_steps = int(len(train_dataloader) * config.bge_epochs * config.bge_warmup_ratio)
+        optimizer_steps_per_epoch = max(1, math.ceil(len(train_dataloader) / grad_accum))
+        warmup_steps = int(optimizer_steps_per_epoch * config.bge_epochs * config.bge_warmup_ratio)
         optimizer = torch.optim.AdamW(encoder.parameters(), lr=config.bge_lr, weight_decay=0.01)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=max(1, len(train_dataloader) * config.bge_epochs),
+            num_training_steps=max(1, optimizer_steps_per_epoch * config.bge_epochs),
         )
         scaler = torch.cuda.amp.GradScaler(enabled=bool(config.bge_use_amp and device.type == "cuda"))
         try:
@@ -186,20 +193,23 @@ def train_bge(config: Any) -> None:
             encoder.train()
             for epoch in range(config.bge_epochs):
                 total_loss = 0.0
+                optimizer.zero_grad(set_to_none=True)
                 for step, batch in enumerate(train_dataloader, start=1):
-                    optimizer.zero_grad(set_to_none=True)
                     with torch.cuda.amp.autocast(enabled=bool(config.bge_use_amp and device.type == "cuda")):
                         query_embeddings = encode_texts(batch["queries"], encoder, tokenizer)
                         positive_embeddings = encode_texts(batch["positives"], encoder, tokenizer)
                         negative_embeddings = encode_texts(batch["negatives"], encoder, tokenizer)
                         loss = contrastive_loss(query_embeddings, positive_embeddings, negative_embeddings)
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
+                        scaled_loss = loss / grad_accum
+                    scaler.scale(scaled_loss).backward()
                     total_loss += float(loss.detach().cpu())
+                    if step % grad_accum == 0 or step == len(train_dataloader):
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
                     if step == 1 or step % 50 == 0 or step == len(train_dataloader):
                         avg_loss = total_loss / step
                         print(f"[train_bge] epoch={epoch + 1}/{config.bge_epochs} step={step}/{len(train_dataloader)} loss={avg_loss:.4f}")

@@ -5,9 +5,9 @@ from collections import defaultdict
 from typing import Any
 
 
-DEFAULT_RANKING_KS = [1, 3, 5, 10, 20]
-DEFAULT_NDCG_KS = [3, 5, 10, 20]
-DEFAULT_TOPK_TUNE_KS = [1, 2, 3, 5, 10, 20, 50, 100]
+DEFAULT_RANKING_KS = [1, 3, 5, 10, 20, 50]
+DEFAULT_NDCG_KS = [3, 5, 10, 20, 50]
+DEFAULT_TOPK_TUNE_KS = [1, 2, 3, 4, 5]
 
 
 def group_ranked(rows: list[dict[str, Any]], score_field: str | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -81,7 +81,7 @@ def threshold_metrics(
     *,
     score_field: str,
     threshold: float,
-    fallback_top_k_if_empty: int = 3,
+    fallback_top_k_if_empty: int = 5,
     max_candidates_per_query: int = 5,
 ) -> dict[str, float]:
     positives_by_qid = {row["qid"]: set(row["relevant_laws"]) for row in questions}

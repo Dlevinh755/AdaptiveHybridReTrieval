@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
+from src.eval.metrics import aggregate_by_aid_max, ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
 from src.utils.artifact import eval_dir, is_complete, mark_done, prepared_dir, read_json, read_table, retrieval_dir, stable_hash, write_json, write_table
 from src.utils.logging import saved, skip
 
@@ -219,13 +219,17 @@ def _write_rerank_metrics(
         split_name: _add_query_minmax_score(rows, "rerank_score", "rerank_score_norm")
         for split_name, rows in split_rows.items()
     }
-    threshold_info = tune_threshold(normalized_split_rows["val"], split_questions["val"], score_field="rerank_score_norm")
+    aid_aggregated_rows = {
+        split_name: aggregate_by_aid_max(rows, score_field="rerank_score_norm")
+        for split_name, rows in normalized_split_rows.items()
+    }
+    threshold_info = tune_threshold(aid_aggregated_rows["val"], split_questions["val"], score_field="rerank_score_norm")
     threshold = float(threshold_info["threshold"])
-    topk_info = tune_top_k(normalized_split_rows["val"], split_questions["val"], score_field="rerank_score_norm")
+    topk_info = tune_top_k(aid_aggregated_rows["val"], split_questions["val"], score_field="rerank_score_norm")
     tuned_top_k = int(topk_info["top_k"])
     metrics_by_split: dict[str, Any] = {}
     for split_name in ["val", "test"]:
-        rows = normalized_split_rows[split_name]
+        rows = aid_aggregated_rows[split_name]
         questions = split_questions[split_name]
         payload = {
             "split": split_name,
@@ -380,11 +384,13 @@ def rerank_bge(config: Any) -> None:
         _assert_max_candidates(split_rows, top_k=config.candidate_top_k, label=f"bge_rerank {split_name} rows")
         _assert_no_duplicate_chunks(split_rows, label=f"bge_rerank {split_name} rows")
         split_rows_by_name[split_name] = split_rows
-        split_fmt = write_table(split_path, split_rows)
+        split_rows_with_norm = _add_query_minmax_score(split_rows, "rerank_score", "rerank_score_norm")
+        split_fmt = write_table(split_path, split_rows_with_norm)
         mark_done(split_path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params={**expected_params, "split": split_name}, fmt=split_fmt)
         saved(split_path)
 
-    fmt = write_table(path, ranked)
+    ranked_with_norm = _add_query_minmax_score(ranked, "rerank_score", "rerank_score_norm")
+    fmt = write_table(path, ranked_with_norm)
     mark_done(path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params={**expected_params, "split": "aggregate"}, fmt=fmt)
     split_questions = {
         split_name: _filter_questions(all_questions, qids)
